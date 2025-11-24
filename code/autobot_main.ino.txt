@@ -1,0 +1,14 @@
+// AUTOBOT BASE CODE - v1
+// This file will hold the main Arduino sketch.
+// We will keep updating it as we add sensors and modules.
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Autobot starting...");
+}
+
+void loop() {
+  // temporary loop so the file is valid
+  Serial.println("Robot running...");
+  delay(1000);
+}
