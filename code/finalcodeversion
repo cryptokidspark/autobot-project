@@ -1,0 +1,241 @@
+/*
+ * SMART ROBOT CAR – FINAL WORKING CODE FOR ARDUINO UNO R3
+ * FIXED & DEBUGGED
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Servo.h>
+#include <IRremote.h>
+
+// ----------------------- PIN DEFINITIONS -----------------------
+
+// IR receiver
+const uint8_t IR_RECEIVE_PIN = 12;
+
+// TB6612 / motor driver pins
+const uint8_t STBY_PIN = 8;
+
+// Right motor
+const uint8_t PWMA = 5;        // PWM
+const uint8_t AIN1 = 7;
+const uint8_t AIN2 = 6;
+
+// Left motor
+const uint8_t PWMB = 9;        // PWM
+const uint8_t BIN1 = 11;
+const uint8_t BIN2 = 10;
+
+// Ultrasonic sensor
+const uint8_t TRIG_PIN = 3;
+const uint8_t ECHO_PIN = 2;
+
+// Line tracking sensors
+const uint8_t LINE_LEFT_PIN  = A0;
+const uint8_t LINE_MID_PIN   = A1;
+const uint8_t LINE_RIGHT_PIN = A2;
+
+// Servo
+const uint8_t SERVO_PIN = 4;
+Servo ultrasonicServo;
+
+// -------------------- IR KEY VALUES (CHANGE THESE!) --------------------
+const uint32_t IR_KEY_UP      = 0x00;  // CHANGE
+const uint32_t IR_KEY_DOWN    = 0x00;  // CHANGE
+const uint32_t IR_KEY_LEFT    = 0x00;  // CHANGE
+const uint32_t IR_KEY_RIGHT   = 0x00;  // CHANGE
+const uint32_t IR_KEY_OK      = 0x00;  // CHANGE
+const uint32_t IR_KEY_1       = 0x00;  // CHANGE
+const uint32_t IR_KEY_2       = 0x00;  // CHANGE
+const uint32_t IR_KEY_3       = 0x00;  // CHANGE
+const uint32_t IR_KEY_4       = 0x00;  // CHANGE
+const uint32_t IR_KEY_5       = 0x00;  // CHANGE
+const uint32_t IR_KEY_6       = 0x00;  // CHANGE
+const uint32_t IR_KEY_7       = 0x00;  // CHANGE
+const uint32_t IR_KEY_8       = 0x00;  // CHANGE
+const uint32_t IR_KEY_9       = 0x00;  // CHANGE
+
+// ------------------- CONTROL SETTINGS -------------------
+enum ControlMode {
+  MODE_MANUAL = 0,
+  MODE_LINE_TRACKING,
+  MODE_OBSTACLE_AVOID,
+  MODE_AUTO_FOLLOW
+};
+
+ControlMode currentMode = MODE_MANUAL;
+
+// speed settings
+int defaultSpeed = 160;
+int currentSpeed = 160;
+int minSpeed = 80;
+int maxSpeed = 255;
+
+// line sensor threshold
+int lineThreshold = 500;
+
+// ----------------------- IR RECEIVER -----------------------
+IRrecv irrecv(IR_RECEIVE_PIN);
+decode_results results;
+
+// ----------------------- MOTOR CONTROL ---------------------
+
+void setMotorRaw(uint8_t in1, uint8_t in2, uint8_t pwmPin, int speed) {
+  if (speed > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+    analogWrite(pwmPin, speed);
+  } 
+  else if (speed < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    analogWrite(pwmPin, -speed);
+  } 
+  else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+    analogWrite(pwmPin, 0);
+  }
+}
+
+void setMotors(int leftSpeed, int rightSpeed) {
+  digitalWrite(STBY_PIN, HIGH);  // ENABLE DRIVER
+  setMotorRaw(AIN1, AIN2, PWMA, rightSpeed);
+  setMotorRaw(BIN1, BIN2, PWMB, leftSpeed);
+}
+
+void stopMotors() {
+  setMotors(0, 0);
+  digitalWrite(STBY_PIN, HIGH);   // DO NOT DISABLE DRIVER
+}
+
+// ----------------------- ULTRASONIC -------------------------
+
+long measureDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000UL);
+
+  if (duration == 0) return 999;  // assume no obstacle
+
+  return duration / 29 / 2;
+}
+
+// ----------------------- LINE TRACKING ----------------------
+
+void stepLineTracking() {
+  int L = analogRead(LINE_LEFT_PIN);
+  int M = analogRead(LINE_MID_PIN);
+  int R = analogRead(LINE_RIGHT_PIN);
+
+  bool left = (L < lineThreshold);
+  bool mid  = (M < lineThreshold);
+  bool right= (R < lineThreshold);
+
+  if (mid && !left && !right) {
+    setMotors(currentSpeed, currentSpeed);
+  }
+  else if (left && !right) {
+    setMotors(-currentSpeed, currentSpeed);
+  }
+  else if (right && !left) {
+    setMotors(currentSpeed, -currentSpeed);
+  }
+  else {
+    stopMotors();
+  }
+}
+
+// ----------------------- OBSTACLE AVOID ----------------------
+
+void stepObstacleAvoid() {
+  long d = measureDistanceCm();
+
+  if (d < 20) {
+    stopMotors();
+    delay(200);
+    setMotors(-currentSpeed, -currentSpeed);
+    delay(300);
+    setMotors(currentSpeed, -currentSpeed);
+    delay(350);
+  }
+  else {
+    setMotors(currentSpeed, currentSpeed);
+  }
+}
+
+// ----------------------- AUTO FOLLOW ------------------------
+
+void stepAutoFollow() {
+  long d = measureDistanceCm();
+
+  if (d > 40) {
+    setMotors(currentSpeed, currentSpeed);
+  }
+  else if (d < 15) {
+    setMotors(-currentSpeed, -currentSpeed);
+  }
+  else {
+    stopMotors();
+  }
+}
+
+// ---------------------- IR HANDLER --------------------------
+
+void handleIR(uint32_t value) {
+  if (value == IR_KEY_UP)    { currentMode = MODE_MANUAL; setMotors(currentSpeed, currentSpeed); }
+  if (value == IR_KEY_DOWN)  { currentMode = MODE_MANUAL; setMotors(-currentSpeed, -currentSpeed); }
+  if (value == IR_KEY_LEFT)  { currentMode = MODE_MANUAL; setMotors(-currentSpeed, currentSpeed); }
+  if (value == IR_KEY_RIGHT) { currentMode = MODE_MANUAL; setMotors(currentSpeed, -currentSpeed); }
+  if (value == IR_KEY_OK)    { stopMotors(); }
+
+  if (value == IR_KEY_1) { currentMode = MODE_LINE_TRACKING; stopMotors(); }
+  if (value == IR_KEY_2) { currentMode = MODE_OBSTACLE_AVOID; stopMotors(); }
+  if (value == IR_KEY_3) { currentMode = MODE_AUTO_FOLLOW; stopMotors(); }
+}
+
+// ----------------------- SETUP ------------------------------
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(STBY_PIN, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  ultrasonicServo.attach(SERVO_PIN);
+  ultrasonicServo.write(90);
+
+  irrecv.enableIRIn();
+
+  stopMotors();
+}
+
+// ----------------------- LOOP -------------------------------
+
+void loop() {
+  if (irrecv.decode(&results)) {
+    handleIR(results.value);
+    irrecv.resume();
+  }
+
+  switch (currentMode) {
+    case MODE_MANUAL: break;
+    case MODE_LINE_TRACKING: stepLineTracking(); break;
+    case MODE_OBSTACLE_AVOID: stepObstacleAvoid(); break;
+    case MODE_AUTO_FOLLOW: stepAutoFollow(); break;
+  }
+
+  delay(20);
+}
