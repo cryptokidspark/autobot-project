@@ -1,0 +1,356 @@
+/*
+  SunFounder Arduino UNO R4 WiFi
+  SSD1306 128x64 I2C OLED + HC-SR04 ultrasonic sensor
+
+  Behavior:
+    - Two Mo-chan-style rounded-square eyes, fully filled.
+    - Eyes are closer together.
+    - Calm:
+        * Eyes change size side-by-side (one bigger, one smaller).
+        * Gaze cycles between looking UP, RIGHT, and LEFT.
+        * Distance influences eyelid openness (alert/sleepy).
+        * Normal blinking.
+    - Scared:
+        * Triggered whenever distance changes noticeably.
+        * Eyes get bigger, outer top corners lower, both eyes and pupils shake.
+        * No blinking.
+    - No eyebrows, no cornea/highlight.
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <math.h>
+
+// OLED configuration
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Ultrasonic sensor pins
+const int TRIG_PIN = 8;
+const int ECHO_PIN = 9;
+
+// Eye base geometry
+const int EYE_WIDTH         = 34;
+const int EYE_HEIGHT        = 26;
+const int EYE_CORNER_RADIUS = 8;
+const int IRIS_RADIUS       = 9;
+
+// Eyes closer together
+const int LEFT_EYE_CENTERX  = 45;
+const int RIGHT_EYE_CENTERX = 83;
+const int EYES_CENTERY      = 32;
+
+// Blink parameters
+const int BLINK_STEPS = 4;
+unsigned long lastBlinkMillis = 0;
+unsigned long blinkInterval   = 3000;
+bool isBlinking = false;
+int  blinkStep  = 0;
+
+// Scared reaction when distance changes
+int  reactionFrames                   = 0;
+const int MAX_REACTION_FRAMES         = 25;
+// Small threshold to avoid noise; reacts to real changes
+const float DISTANCE_CHANGE_THRESHOLD = 1.0f; // cm
+
+// Distance tracking
+float previousDistance = -1.0;
+
+// Prototypes
+float getDistanceCm();
+void drawEyes(bool scary, int blinkAmount, int shakeOffsetX, int shakeOffsetY);
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  Serial.begin(115200);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    while (true) { } // stop if display fails
+  }
+
+  display.setRotation(2);
+
+  display.clearDisplay();
+  display.display();
+
+  randomSeed(analogRead(A0));
+
+  drawEyes(false, 0, 0, 0);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // 1. Measure distance
+  float distance = getDistanceCm();
+
+  if (distance > 0 && distance < 400) {
+    // 2. Distance-change detection
+    if (previousDistance < 0) {
+      previousDistance = distance;
+    } else {
+      float diff = fabs(distance - previousDistance);
+      if (diff >= DISTANCE_CHANGE_THRESHOLD) {
+        // Any real change triggers scared reaction
+        reactionFrames = MAX_REACTION_FRAMES;
+      }
+      previousDistance = distance;
+    }
+
+    bool scary = (reactionFrames > 0);
+
+    // 3. Distance → eyelid / iris base expression
+    int baseBlinkAmount  = 0; // 0=open, BLINK_STEPS=closed
+    int pupilBaseOffsetY = 0;
+
+    if (scary) {
+      baseBlinkAmount  = 0;   // wide open
+      pupilBaseOffsetY = -1;  // slightly up
+    } else {
+      // close / medium / far
+      if (distance < 15) {
+        baseBlinkAmount  = 0;
+        pupilBaseOffsetY = -2;
+      } else if (distance < 40) {
+        baseBlinkAmount  = 1;
+        pupilBaseOffsetY = 0;
+      } else {
+        baseBlinkAmount  = 3; // sleepier
+        pupilBaseOffsetY = 2;
+      }
+    }
+
+    // 4. Blinking (off when scared)
+    int dynamicBlinkAmount = 0;
+    if (!scary) {
+      if (!isBlinking && (now - lastBlinkMillis > blinkInterval)) {
+        isBlinking = true;
+        blinkStep  = 0;
+      }
+
+      if (isBlinking) {
+        blinkStep++;
+        if (blinkStep <= BLINK_STEPS) {
+          dynamicBlinkAmount = blinkStep; // closing
+        } else if (blinkStep <= BLINK_STEPS * 2) {
+          dynamicBlinkAmount = BLINK_STEPS * 2 - blinkStep; // opening
+        } else {
+          isBlinking = false;
+          blinkStep  = 0;
+          dynamicBlinkAmount = 0;
+          lastBlinkMillis = now;
+          blinkInterval = 2500 + random(0, 2000); // 2.5–4.5 s
+        }
+      }
+    } else {
+      isBlinking = false;
+      blinkStep  = 0;
+      dynamicBlinkAmount = 0;
+    }
+
+    int totalBlinkAmount = baseBlinkAmount + dynamicBlinkAmount;
+    if (totalBlinkAmount > BLINK_STEPS) totalBlinkAmount = BLINK_STEPS;
+
+    // 5. Shake while scared
+    int shakeOffsetX = 0;
+    int shakeOffsetY = 0;
+    if (scary) {
+      shakeOffsetX = random(-3, 4); // -3..+3
+      shakeOffsetY = random(-2, 3); // -2..+2
+      reactionFrames--;
+    }
+
+    // 6. Draw
+    drawEyes(scary, totalBlinkAmount, shakeOffsetX, shakeOffsetY);
+  }
+
+  delay(40);
+}
+
+// Measure distance from HC-SR04 in centimeters
+float getDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30 ms timeout
+  if (duration == 0) return -1.0;
+
+  float distance = duration * 0.0343f / 2.0f;
+  return distance;
+}
+
+// Draw Mo-chan-like eyes, fully filled, with calm/scared modes
+void drawEyes(bool scary, int blinkAmount, int shakeOffsetX, int shakeOffsetY) {
+  display.clearDisplay();
+
+  // ---- Eye scaling (size) ----
+  float scaleLeft  = 1.0f;
+  float scaleRight = 1.0f;
+
+  if (scary) {
+    scaleLeft  = 1.5f;
+    scaleRight = 1.5f;
+  } else {
+    // calm: side-by-side size change
+    unsigned long t = millis();
+    float phase = (t % 2000) / 2000.0f * 2.0f * PI; // 2s cycle
+    float s = sin(phase);
+    scaleLeft  = 1.0f + 0.20f * s;
+    scaleRight = 1.0f - 0.20f * s;
+  }
+
+  int eyeWidthL  = (int)(EYE_WIDTH  * scaleLeft);
+  int eyeHeightL = (int)(EYE_HEIGHT * scaleLeft);
+  int eyeWidthR  = (int)(EYE_WIDTH  * scaleRight);
+  int eyeHeightR = (int)(EYE_HEIGHT * scaleRight);
+
+  if (eyeWidthL  < 10) eyeWidthL  = 10;
+  if (eyeHeightL <  8) eyeHeightL = 8;
+  if (eyeWidthR  < 10) eyeWidthR  = 10;
+  if (eyeHeightR <  8) eyeHeightR = 8;
+
+  int cornerRadiusL = (int)(EYE_CORNER_RADIUS * scaleLeft);
+  int cornerRadiusR = (int)(EYE_CORNER_RADIUS * scaleRight);
+  if (cornerRadiusL < 2) cornerRadiusL = 2;
+  if (cornerRadiusR < 2) cornerRadiusR = 2;
+
+  // Eye top-left positions, keep centers fixed
+  int leftEyeX  = LEFT_EYE_CENTERX  - eyeWidthL  / 2;
+  int leftEyeY  = EYES_CENTERY      - eyeHeightL / 2;
+  int rightEyeX = RIGHT_EYE_CENTERX - eyeWidthR  / 2;
+  int rightEyeY = EYES_CENTERY      - eyeHeightR / 2;
+
+  // Whole-eye shake (scared)
+  if (scary) {
+    leftEyeX  += shakeOffsetX;
+    rightEyeX += shakeOffsetX;
+    leftEyeY  += shakeOffsetY;
+    rightEyeY += shakeOffsetY;
+  }
+
+  // Filled white eye boxes
+  display.fillRoundRect(leftEyeX,  leftEyeY,  eyeWidthL, eyeHeightL, cornerRadiusL, SSD1306_WHITE);
+  display.fillRoundRect(rightEyeX, rightEyeY, eyeWidthR, eyeHeightR, cornerRadiusR, SSD1306_WHITE);
+
+  // ---- Extra scared shape: outer top corners lowered ----
+  if (scary) {
+    // Left eye: top-left outer corner
+    display.fillTriangle(
+      leftEyeX, leftEyeY,
+      leftEyeX + eyeWidthL / 3, leftEyeY,
+      leftEyeX, leftEyeY + eyeHeightL / 3,
+      SSD1306_BLACK
+    );
+    // Right eye: top-right outer corner
+    display.fillTriangle(
+      rightEyeX + eyeWidthR, rightEyeY,
+      rightEyeX + eyeWidthR - eyeWidthR / 3, rightEyeY,
+      rightEyeX + eyeWidthR, rightEyeY + eyeHeightR / 3,
+      SSD1306_BLACK
+    );
+  }
+
+  // ---- Iris (big black pupil) ----
+  int irisRadiusL = (int)(IRIS_RADIUS * scaleLeft  * (scary ? 1.15f : 1.0f));
+  int irisRadiusR = (int)(IRIS_RADIUS * scaleRight * (scary ? 1.15f : 1.0f));
+  if (irisRadiusL < 3) irisRadiusL = 3;
+  if (irisRadiusR < 3) irisRadiusR = 3;
+
+  int leftIrisX  = LEFT_EYE_CENTERX;
+  int rightIrisX = RIGHT_EYE_CENTERX;
+  int irisY      = EYES_CENTERY;
+
+  // Gaze direction in calm mode: cycle UP → RIGHT → LEFT
+  if (!scary) {
+    unsigned long tG = millis() / 700; // ~0.7s per gaze
+    int gazeState = tG % 3;
+    int gazeX = 0;
+    int gazeY = 0;
+
+    if (gazeState == 0) {       // look up
+      gazeY = -3;
+    } else if (gazeState == 1) {// look right
+      gazeX = 4;
+    } else {                    // look left
+      gazeX = -4;
+    }
+
+    leftIrisX  += gazeX;
+    rightIrisX += gazeX;
+    irisY      += gazeY;
+  }
+
+  // Shake for pupils in scared mode
+  if (scary) {
+    leftIrisX  += shakeOffsetX;
+    rightIrisX += shakeOffsetX;
+    irisY      += shakeOffsetY;
+  }
+
+  // Keep iris roughly inside base eye area
+  int maxOffsetX = EYE_WIDTH / 2 - IRIS_RADIUS - 2;
+  if (maxOffsetX < 0) maxOffsetX = 0;
+  int maxOffsetY = EYE_HEIGHT / 2 - IRIS_RADIUS - 2;
+  if (maxOffsetY < 0) maxOffsetY = 0;
+
+  if (leftIrisX  < LEFT_EYE_CENTERX  - maxOffsetX) leftIrisX  = LEFT_EYE_CENTERX  - maxOffsetX;
+  if (leftIrisX  > LEFT_EYE_CENTERX  + maxOffsetX) leftIrisX  = LEFT_EYE_CENTERX  + maxOffsetX;
+  if (rightIrisX < RIGHT_EYE_CENTERX - maxOffsetX) rightIrisX = RIGHT_EYE_CENTERX - maxOffsetX;
+  if (rightIrisX > RIGHT_EYE_CENTERX + maxOffsetX) rightIrisX = RIGHT_EYE_CENTERX + maxOffsetX;
+
+  if (irisY < EYES_CENTERY - maxOffsetY) irisY = EYES_CENTERY - maxOffsetY;
+  if (irisY > EYES_CENTERY + maxOffsetY) irisY = EYES_CENTERY + maxOffsetY;
+
+  // Draw iris
+  display.fillCircle(leftIrisX,  irisY, irisRadiusL, SSD1306_BLACK);
+  display.fillCircle(rightIrisX, irisY, irisRadiusR, SSD1306_BLACK);
+
+  // ---- Eyelids (blink) ----
+  int eyelidPixelsL = map(blinkAmount, 0, BLINK_STEPS, 0, eyeHeightL / 2 + 3);
+  int eyelidPixelsR = map(blinkAmount, 0, BLINK_STEPS, 0, eyeHeightR / 2 + 3);
+
+  if (eyelidPixelsL > 0) {
+    display.fillRect(leftEyeX,
+                     leftEyeY,
+                     eyeWidthL,
+                     eyelidPixelsL,
+                     SSD1306_BLACK);
+  }
+  if (eyelidPixelsR > 0) {
+    display.fillRect(rightEyeX,
+                     rightEyeY,
+                     eyeWidthR,
+                     eyelidPixelsR,
+                     SSD1306_BLACK);
+  }
+
+  int bottomCoverHeightL = eyelidPixelsL / 2;
+  int bottomCoverHeightR = eyelidPixelsR / 2;
+
+  if (bottomCoverHeightL > 0) {
+    display.fillRect(leftEyeX,
+                     leftEyeY + eyeHeightL - bottomCoverHeightL,
+                     eyeWidthL,
+                     bottomCoverHeightL,
+                     SSD1306_BLACK);
+  }
+  if (bottomCoverHeightR > 0) {
+    display.fillRect(rightEyeX,
+                     rightEyeY + eyeHeightR - bottomCoverHeightR,
+                     eyeWidthR,
+                     bottomCoverHeightR,
+                     SSD1306_BLACK);
+  }
+
+  display.display();
+}
